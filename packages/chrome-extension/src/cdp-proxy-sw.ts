@@ -23,6 +23,7 @@ import type {
   CdpResponseMsg,
 } from '../../webapp/src/kernel/messages.js';
 import { notifyBridgeDebuggerDetached } from './bridge-sw.js';
+import { isProtectedTarget, isProtectedUrl, PROTECTED_REFUSAL } from './protected-origins.js';
 import { buildSecretsPipeline } from './secrets-sw.js';
 import { postServiceWorkerMessage } from './sw-broadcast.js';
 import { addToSliccGroup } from './tab-group-sw.js';
@@ -148,7 +149,30 @@ async function cdpAttachToTarget(params: CdpPayload): Promise<CdpPayload> {
   const targetId = params['targetId'] as string;
   const tabId = tabIdFromTargetId(targetId);
 
+  // B24-1: refuse to attach to a tab on a protected origin.
+  // Use isProtectedTarget so about:blank inheriting a protected opener is refused.
+  try {
+    const tab = await chrome.tabs.get(tabId);
+    if (tab && isProtectedTarget(tab.url ?? '', false, 'unknown')) {
+      throw new Error(PROTECTED_REFUSAL);
+    }
+  } catch (err) {
+    if (err instanceof Error && err.message === PROTECTED_REFUSAL) throw err;
+  }
+
   await acquireDebuggerAttachment(tabId, 'legacy');
+
+  // B24-1 TOCTOU: revalidate after attach.
+  try {
+    const postTab = await chrome.tabs.get(tabId);
+    if (postTab && isProtectedTarget(postTab.url ?? '', false, 'unknown')) {
+      sessionToTab.delete(targetId);
+      await releaseDebuggerAttachment(tabId, 'legacy');
+      throw new Error(PROTECTED_REFUSAL);
+    }
+  } catch (err) {
+    if (err instanceof Error && err.message === PROTECTED_REFUSAL) throw err;
+  }
 
   const sessionId = targetId;
   sessionToTab.set(sessionId, tabId);
@@ -172,6 +196,10 @@ async function cdpDetachFromTarget(params: CdpPayload): Promise<CdpPayload> {
 
 async function cdpCreateTarget(params: CdpPayload): Promise<CdpPayload> {
   const url = (params['url'] as string) ?? 'about:blank';
+  // B24-1: refuse to create a target on a protected origin.
+  if (isProtectedTarget(url)) {
+    throw new Error(PROTECTED_REFUSAL);
+  }
   const tab = await chrome.tabs.create({ url, active: false });
   await addToSliccGroup(tab.id);
   return { targetId: String(tab.id) };
@@ -255,6 +283,14 @@ async function cdpSendCommand(
     );
   }
 
+  // B24-1: refuse Page.navigate to a protected URL.
+  if (method === 'Page.navigate') {
+    const navUrl = typeof params?.['url'] === 'string' ? params['url'] : undefined;
+    if (navUrl && isProtectedUrl(navUrl)) {
+      throw new Error(PROTECTED_REFUSAL);
+    }
+  }
+
   const effectiveParams = await maybeUnmaskCdpFrame(tabId, method, params);
   const result = await chrome.debugger.sendCommand({ tabId }, method, effectiveParams);
   return result ?? {};
@@ -300,4 +336,20 @@ function handleDebuggerDetach(source: ChromeDebuggerTarget): void {
 export function installCdpProxyListeners(): void {
   chrome.debugger.onEvent.addListener(forwardDebuggerEvent);
   chrome.debugger.onDetach.addListener(handleDebuggerDetach);
+}
+
+/**
+ * B24-1: Check if any legacy-attached tab has navigated to a protected origin.
+ * If so, detach the debugger and clean up session state. Called from the shared
+ * `chrome.tabs.onUpdated` listener in service-worker.ts.
+ */
+export function checkLegacyTabProtection(tabId: number, url: string | undefined): void {
+  if (!url || !isProtectedUrl(url)) return;
+  const sessionId = legacySessionIdForTab(tabId);
+  if (sessionId === undefined) return;
+
+  // Clean up legacy session state and force-detach.
+  sessionToTab.delete(sessionId);
+  forceReleaseDebuggerAttachment(tabId).catch(() => {});
+  notifyBridgeDebuggerDetached(tabId);
 }
