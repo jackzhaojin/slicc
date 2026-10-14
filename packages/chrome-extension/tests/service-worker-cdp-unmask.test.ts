@@ -76,6 +76,7 @@ describe('service-worker CDP outgoing unmask', () => {
 
     (globalThis as any).chrome = {
       runtime: {
+        id: 'test-ext-id',
         onConnect: { addListener: vi.fn() },
         onConnectExternal: {
           addListener: (listener: (port: FakePort) => void) =>
@@ -87,7 +88,6 @@ describe('service-worker CDP outgoing unmask', () => {
         onUpdateAvailable: { addListener: vi.fn() },
         reload: vi.fn(),
         getContexts: vi.fn(async () => []),
-        id: 'test-id',
         sendMessage: vi.fn(async (m: any) => {
           runtimeSentMessages.push(m);
         }),
@@ -174,7 +174,11 @@ describe('service-worker CDP outgoing unmask', () => {
 
   async function dispatchOffscreen(payload: unknown): Promise<void> {
     for (const l of messageListeners) {
-      l({ source: 'offscreen', payload }, {}, () => {});
+      l(
+        { source: 'offscreen', payload },
+        { id: 'test-ext-id', origin: 'chrome-extension://test-ext-id' },
+        () => {}
+      );
     }
     // Let the async handleCdpCommand chain run.
     await new Promise((r) => setTimeout(r, 30));
